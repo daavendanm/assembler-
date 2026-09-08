@@ -7,14 +7,21 @@ Usage: $(basename "$0") -r REFERENCE.fasta -i READS.fastq[.gz] -o OUTPUT_PREFIX 
 
 Reference-based mapping, variant calling, and consensus generation for a
 plasmid sequenced with Oxford Nanopore (ONT) long reads (minimap2 +
-bcftools). This is NOT de novo assembly: it reconstructs the sample's
-plasmid sequence by mapping reads onto the closest reference you supply
-and calling the consensus, so it can only find differences from that
-reference (SNPs/small indels/coverage gaps) -- it cannot discover larger
-structural rearrangements, insertions of unrelated sequence, or confirm
-that the plasmid is genuinely circular in the sample. Cross-check the
-result (e.g. with scripts/ncbi_strain_search.py) before treating it as a
-finished sequence.
+bcftools), plus a structural difference report that accounts for large
+deletions and insertions relative to the reference.
+
+This is NOT de novo assembly: it reconstructs the sample's plasmid by
+mapping reads onto the reference you supply. It can therefore measure how
+much of the reference is present in the sample and where the sample
+departs from it, but it can never reconstruct sequence that is absent
+from the reference -- inserted sequence is reported and extracted from
+the reads, not assembled. Cross-check the result (e.g. with
+scripts/ncbi_strain_search.py) before treating it as a finished sequence.
+
+Regions with no read support are masked with N in the consensus rather
+than silently inheriting reference bases, and a trimmed consensus with
+those regions removed is written alongside it. Use this to confirm, for
+example, that a cassette was excised and the rest re-cloned intact.
 
 Required:
   -r  Reference plasmid, FASTA, single record (closest known/public backbone)
@@ -41,6 +48,14 @@ Optional:
   -Q  Minimum base quality for mpileup (default: 7) -- ONT base qualities
       are on a different scale than Illumina's; this is a lenient
       provisional default, review before trusting it
+  -s  Minimum size in bp for a structural event (deletion/insertion) to be
+      reported (default: 50). bcftools only calls small variants, so
+      anything at this scale comes from the alignment analysis instead.
+  -k  Depth below which a base counts as having NO read support and is
+      masked with N (default: 1, i.e. only zero-coverage bases). This is
+      deliberately not the same as -d: masking removes sequence from the
+      supported consensus, so it should only fire where there is genuinely
+      no evidence, not merely low coverage.
 
 Notes:
   - bcftools mpileup/call was designed primarily for short, high base-
@@ -64,8 +79,10 @@ MAX_DEPTH=4000
 MIN_BASEQ=7
 PAD=2000
 CIRCULAR=0
+MIN_SV_SIZE=50
+MASK_DEPTH=1
 
-while getopts "r:i:o:t:q:d:D:Q:p:ch" opt; do
+while getopts "r:i:o:t:q:d:D:Q:p:s:k:ch" opt; do
     case "$opt" in
         r) REF="$OPTARG" ;;
         i) READS="$OPTARG" ;;
@@ -76,6 +93,8 @@ while getopts "r:i:o:t:q:d:D:Q:p:ch" opt; do
         D) MAX_DEPTH="$OPTARG" ;;
         Q) MIN_BASEQ="$OPTARG" ;;
         p) PAD="$OPTARG" ;;
+        s) MIN_SV_SIZE="$OPTARG" ;;
+        k) MASK_DEPTH="$OPTARG" ;;
         c) CIRCULAR=1 ;;
         h) usage ;;
         *) usage ;;
@@ -99,7 +118,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 outdir="$(dirname "$OUT")"
 [[ "$outdir" == "." ]] || mkdir -p "$outdir"
 
-STEP_TOTAL=7
+STEP_TOTAL=8
 STEP=1
 
 if [[ "$CIRCULAR" -eq 1 ]]; then
@@ -121,6 +140,16 @@ minimap2 -ax map-ont -t "$THREADS" "$MAPREF" "$READS" \
 samtools index "${OUT}.sorted.bam"
 STEP=$((STEP + 1))
 
+echo "[${STEP}/${STEP_TOTAL}] Analyzing structural differences (large indels, clips, coverage)..." >&2
+REPORT_ARGS=(report -a "${OUT}.sorted.bam" -r "$MAPREF" -o "$OUT"
+             --min-sv-size "$MIN_SV_SIZE" --min-depth "$MIN_DEPTH"
+             --mask-depth "$MASK_DEPTH")
+if [[ "$CIRCULAR" -eq 1 ]]; then
+    REPORT_ARGS+=(--circular-meta "${MAPREF}.meta")
+fi
+python3 "${SCRIPT_DIR}/indel_report.py" "${REPORT_ARGS[@]}"
+STEP=$((STEP + 1))
+
 echo "[${STEP}/${STEP_TOTAL}] Calling variants with bcftools (haploid, BAQ off)..." >&2
 bcftools mpileup -f "$MAPREF" -B -Q "$MIN_BASEQ" --max-depth "$MAX_DEPTH" -Ou "${OUT}.sorted.bam" \
     | bcftools call -mv --ploidy 1 -Oz -o "${OUT}.raw.vcf.gz"
@@ -133,39 +162,37 @@ bcftools filter -e "QUAL<${MIN_QUAL} || DP<${MIN_DEPTH}" \
 bcftools index -f "${OUT}.filtered.vcf.gz"
 STEP=$((STEP + 1))
 
-echo "[${STEP}/${STEP_TOTAL}] Building consensus sequence..." >&2
+echo "[${STEP}/${STEP_TOTAL}] Building consensus sequence (regions without read support masked as N)..." >&2
 if [[ "$CIRCULAR" -eq 1 ]]; then
-    bcftools consensus -f "$MAPREF" "${OUT}.filtered.vcf.gz" > "${OUT}.consensus_extended.fasta"
+    bcftools consensus -f "$MAPREF" -m "${OUT}.low_coverage.bed" \
+        "${OUT}.filtered.vcf.gz" > "${OUT}.consensus_extended.fasta"
     python3 "${SCRIPT_DIR}/rotate_circular_fasta.py" reconcile \
         -i "${OUT}.consensus_extended.fasta" --meta "${MAPREF}.meta" \
         -o "${OUT}.consensus.fasta"
 else
-    bcftools consensus -f "$MAPREF" "${OUT}.filtered.vcf.gz" > "${OUT}.consensus.fasta"
+    bcftools consensus -f "$MAPREF" -m "${OUT}.low_coverage.bed" \
+        "${OUT}.filtered.vcf.gz" > "${OUT}.consensus.fasta"
 fi
 STEP=$((STEP + 1))
 
-echo "[${STEP}/${STEP_TOTAL}] Writing coverage and variant call statistics..." >&2
-samtools depth -a "${OUT}.sorted.bam" > "${OUT}.depth.txt"
-awk -v mind="$MIN_DEPTH" '
-    { sum += $3; n++; if ($3 >= mind) covered++; if ($3 == 0) zero++ }
-    END {
-        if (n == 0) { print "No positions in depth file."; exit }
-        printf "Reference positions (mapping coordinates): %d\n", n
-        printf "Mean depth: %.1f\n", sum / n
-        printf "Positions with depth >= %d: %d (%.2f%%)\n", mind, covered, 100.0 * covered / n
-        printf "Positions with zero depth: %d (%.2f%%)\n", zero, 100.0 * zero / n
-    }
-' "${OUT}.depth.txt" > "${OUT}.coverage_summary.txt"
+echo "[${STEP}/${STEP_TOTAL}] Writing supported-only consensus and variant statistics..." >&2
+python3 "${SCRIPT_DIR}/indel_report.py" trim \
+    -c "${OUT}.consensus.fasta" -o "${OUT}.consensus_supported.fasta"
 bcftools stats "${OUT}.filtered.vcf.gz" > "${OUT}.stats.txt"
 STEP=$((STEP + 1))
 
 echo "Done." >&2
-echo "  Sorted BAM:         ${OUT}.sorted.bam" >&2
-echo "  Filtered variants:  ${OUT}.filtered.vcf.gz" >&2
-echo "  Consensus plasmid:  ${OUT}.consensus.fasta" >&2
-echo "  Coverage summary:   ${OUT}.coverage_summary.txt" >&2
-echo "  VCF statistics:     ${OUT}.stats.txt" >&2
+echo "  Sorted BAM:            ${OUT}.sorted.bam" >&2
+echo "  Filtered variants:     ${OUT}.filtered.vcf.gz" >&2
+echo "  Consensus (N-masked):  ${OUT}.consensus.fasta" >&2
+echo "  Consensus (supported): ${OUT}.consensus_supported.fasta" >&2
+echo "  Structural report:     ${OUT}.indel_report.txt" >&2
+echo "  Structural variants:   ${OUT}.structural_variants.tsv" >&2
+echo "  Unsupported regions:   ${OUT}.low_coverage.bed" >&2
+echo "  Inserted sequences:    ${OUT}.inserted_sequences.fasta (if any)" >&2
+echo "  Per-base depth:        ${OUT}.depth.tsv" >&2
+echo "  VCF statistics:        ${OUT}.stats.txt" >&2
 echo "" >&2
-echo "Zero-depth or low-depth regions in the coverage summary mean the" >&2
-echo "reference backbone may not match the sample there -- inspect" >&2
-echo "${OUT}.depth.txt before trusting the consensus in those stretches." >&2
+echo "Read ${OUT}.indel_report.txt first: it states how much of the reference" >&2
+echo "the reads support, what is missing, and what the sample carries that the" >&2
+echo "reference does not." >&2
