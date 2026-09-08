@@ -51,6 +51,13 @@ Optional:
   -s  Minimum size in bp for a structural event (deletion/insertion) to be
       reported (default: 50). bcftools only calls small variants, so
       anything at this scale comes from the alignment analysis instead.
+  -A  Input is an assembled sequence (e.g. a provider's *.Plasmid_assembly
+      file), not raw reads. Switches the minimap2 preset to asm5 and drops
+      the depth/support thresholds to 1, since a single record can never
+      satisfy read-set thresholds. Without this, events are silently
+      filtered out and coverage reads 0%.
+  -x  minimap2 preset (default: map-ont; -A implies asm5). Override only if
+      you know which preset your input needs.
   -n  Reads required to report a structural event (default: 2). Set to 1
       when the input is a single assembled sequence rather than a read
       set, otherwise every event it shows will be filtered out.
@@ -85,21 +92,25 @@ CIRCULAR=0
 MIN_SV_SIZE=50
 MASK_DEPTH=1
 MIN_SUPPORT=2
+PRESET="map-ont"
+ASSEMBLY_MODE=0
 
-while getopts "r:i:o:t:q:d:D:Q:p:s:k:n:ch" opt; do
+while getopts "r:i:o:t:q:d:D:Q:p:s:k:n:x:Ach" opt; do
     case "$opt" in
         r) REF="$OPTARG" ;;
         i) READS="$OPTARG" ;;
         o) OUT="$OPTARG" ;;
         t) THREADS="$OPTARG" ;;
-        q) MIN_QUAL="$OPTARG" ;;
-        d) MIN_DEPTH="$OPTARG" ;;
+        q) MIN_QUAL="$OPTARG"; QUAL_SET=1 ;;
+        d) MIN_DEPTH="$OPTARG"; DEPTH_SET=1 ;;
         D) MAX_DEPTH="$OPTARG" ;;
         Q) MIN_BASEQ="$OPTARG" ;;
         p) PAD="$OPTARG" ;;
         s) MIN_SV_SIZE="$OPTARG" ;;
         k) MASK_DEPTH="$OPTARG" ;;
-        n) MIN_SUPPORT="$OPTARG" ;;
+        n) MIN_SUPPORT="$OPTARG"; SUPPORT_SET=1 ;;
+        x) PRESET="$OPTARG"; PRESET_SET=1 ;;
+        A) ASSEMBLY_MODE=1 ;;
         c) CIRCULAR=1 ;;
         h) usage ;;
         *) usage ;;
@@ -108,6 +119,21 @@ done
 
 if [[ -z "${REF:-}" || -z "${READS:-}" || -z "${OUT:-}" ]]; then
     usage
+fi
+
+# An assembled sequence is one high-accuracy record, not a pile of noisy reads:
+# the read-tuned preset and the depth thresholds are both wrong for it. Only
+# defaults are replaced, so anything given explicitly still wins.
+if [[ "$ASSEMBLY_MODE" -eq 1 ]]; then
+    [[ "${PRESET_SET:-0}" -eq 1 ]] || PRESET="asm5"
+    [[ "${SUPPORT_SET:-0}" -eq 1 ]] || MIN_SUPPORT=1
+    [[ "${DEPTH_SET:-0}" -eq 1 ]] || MIN_DEPTH=1
+    [[ "${QUAL_SET:-0}" -eq 1 ]] || MIN_QUAL=1
+    echo "Assembly mode: input treated as a single assembled sequence." >&2
+    echo "  minimap2 preset=${PRESET}, min-support=${MIN_SUPPORT}, min-depth=${MIN_DEPTH}" >&2
+    echo "  The structural report is the meaningful output. The VCF is called from" >&2
+    echo "  a single sequence with no depth behind it -- do not read its QUAL/DP as" >&2
+    echo "  evidence." >&2
 fi
 
 for tool in minimap2 samtools bcftools python3; do
@@ -139,8 +165,8 @@ STEP=$((STEP + 1))
 
 samtools faidx "$MAPREF"
 
-echo "[${STEP}/${STEP_TOTAL}] Mapping ONT reads with minimap2 (map-ont)..." >&2
-minimap2 -ax map-ont -t "$THREADS" "$MAPREF" "$READS" \
+echo "[${STEP}/${STEP_TOTAL}] Mapping with minimap2 (preset=${PRESET})..." >&2
+minimap2 -ax "$PRESET" -t "$THREADS" "$MAPREF" "$READS" \
     | samtools sort -@ "$THREADS" -o "${OUT}.sorted.bam" -
 samtools index "${OUT}.sorted.bam"
 STEP=$((STEP + 1))
