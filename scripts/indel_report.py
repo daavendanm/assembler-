@@ -514,6 +514,23 @@ def write_report(path, stats, coverage, deletions, rearrangements, insertions, c
             f"[dup of N].")
         add("")
 
+    max_depth = max((max(d) if d else 0) for d in coverage.values()) if coverage else 0
+    if max_depth < args.min_support or max_depth < args.min_depth:
+        add("!" * 72)
+        add("WARNING: this dataset cannot satisfy the thresholds in use.")
+        add(f"  Maximum depth anywhere on the reference: {max_depth}")
+        if max_depth < args.min_support:
+            add(f"  --min-support is {args.min_support}, so any event supported by fewer")
+            add("  than that many reads is ABSENT from the tables below, even when the")
+            add("  alignments show it. The coverage section still reports it.")
+        if max_depth < args.min_depth:
+            add(f"  --min-depth is {args.min_depth}, so the 'covered at >= {args.min_depth}x'")
+            add("  figure will read 0% regardless of how well the reference is covered.")
+        add("  If you are comparing a single assembled sequence against the reference")
+        add("  rather than a read set, rerun with --min-support 1 --min-depth 1.")
+        add("!" * 72)
+        add("")
+
     add("--- Reference ---")
     total_ref = 0
     for name, depths in coverage.items():

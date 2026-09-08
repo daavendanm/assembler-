@@ -51,6 +51,9 @@ Optional:
   -s  Minimum size in bp for a structural event (deletion/insertion) to be
       reported (default: 50). bcftools only calls small variants, so
       anything at this scale comes from the alignment analysis instead.
+  -n  Reads required to report a structural event (default: 2). Set to 1
+      when the input is a single assembled sequence rather than a read
+      set, otherwise every event it shows will be filtered out.
   -k  Depth below which a base counts as having NO read support and is
       masked with N (default: 1, i.e. only zero-coverage bases). This is
       deliberately not the same as -d: masking removes sequence from the
@@ -81,8 +84,9 @@ PAD=2000
 CIRCULAR=0
 MIN_SV_SIZE=50
 MASK_DEPTH=1
+MIN_SUPPORT=2
 
-while getopts "r:i:o:t:q:d:D:Q:p:s:k:ch" opt; do
+while getopts "r:i:o:t:q:d:D:Q:p:s:k:n:ch" opt; do
     case "$opt" in
         r) REF="$OPTARG" ;;
         i) READS="$OPTARG" ;;
@@ -95,6 +99,7 @@ while getopts "r:i:o:t:q:d:D:Q:p:s:k:ch" opt; do
         p) PAD="$OPTARG" ;;
         s) MIN_SV_SIZE="$OPTARG" ;;
         k) MASK_DEPTH="$OPTARG" ;;
+        n) MIN_SUPPORT="$OPTARG" ;;
         c) CIRCULAR=1 ;;
         h) usage ;;
         *) usage ;;
@@ -143,7 +148,7 @@ STEP=$((STEP + 1))
 echo "[${STEP}/${STEP_TOTAL}] Analyzing structural differences (large indels, clips, coverage)..." >&2
 REPORT_ARGS=(report -a "${OUT}.sorted.bam" -r "$MAPREF" -o "$OUT"
              --min-sv-size "$MIN_SV_SIZE" --min-depth "$MIN_DEPTH"
-             --mask-depth "$MASK_DEPTH")
+             --mask-depth "$MASK_DEPTH" --min-support "$MIN_SUPPORT")
 if [[ "$CIRCULAR" -eq 1 ]]; then
     REPORT_ARGS+=(--circular-meta "${MAPREF}.meta")
 fi
