@@ -13,6 +13,7 @@ results straight from NCBI's own database with no local setup.
 
 import argparse
 import csv
+import os
 import sys
 import time
 
@@ -108,32 +109,38 @@ def main():
               f"{NCBI_MAX_QUERY_LENGTH}). This will take a while: each "
               f"chunk is a separate NCBI submission.", file=sys.stderr)
 
-    all_rows = []
-    for i, query in enumerate(queries):
-        print(f"Submitting {query.id} to NCBI BLAST "
-              f"({args.program} vs {args.database})...", file=sys.stderr)
-        blast_record = run_blast(query, args)
-        rows = collect_hits(query.id, blast_record, len(query.seq))
-        all_rows.extend(rows)
-        if rows:
-            top = rows[0]
-            print(f"  Closest match: {top['hit_accession']} "
-                  f"{top['hit_description']} "
-                  f"({top['percent_identity']}% identity, "
-                  f"{top['query_coverage_pct']}% coverage)", file=sys.stderr)
-        else:
-            print("  No hits returned.", file=sys.stderr)
-        if i < len(queries) - 1:
-            time.sleep(args.delay)
+    fieldnames = ["query_id", "hit_accession", "hit_description",
+                  "percent_identity", "query_coverage_pct", "evalue"]
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    if not all_rows:
-        sys.exit("No hits found for any query sequence.")
-
+    total_rows = 0
     with open(args.output, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(all_rows[0].keys()))
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(all_rows)
-    print(f"Wrote {len(all_rows)} hit(s) to {args.output}", file=sys.stderr)
+        for i, query in enumerate(queries):
+            print(f"Submitting {query.id} to NCBI BLAST "
+                  f"({args.program} vs {args.database})...", file=sys.stderr)
+            blast_record = run_blast(query, args)
+            rows = collect_hits(query.id, blast_record, len(query.seq))
+            writer.writerows(rows)
+            fh.flush()
+            total_rows += len(rows)
+            if rows:
+                top = rows[0]
+                print(f"  Closest match: {top['hit_accession']} "
+                      f"{top['hit_description']} "
+                      f"({top['percent_identity']}% identity, "
+                      f"{top['query_coverage_pct']}% coverage)", file=sys.stderr)
+            else:
+                print("  No hits returned.", file=sys.stderr)
+            if i < len(queries) - 1:
+                time.sleep(args.delay)
+
+    if total_rows == 0:
+        sys.exit("No hits found for any query sequence.")
+    print(f"Wrote {total_rows} hit(s) to {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":
