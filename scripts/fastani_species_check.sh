@@ -15,7 +15,8 @@ Required:
 
 Optional:
   -t  Comma-separated taxa to compare against (default:
-      "Bacillus licheniformis,Bacillus paralicheniformis,Bacillus sonorensis")
+      "Bacillus licheniformis,Bacillus paralicheniformis,Bacillus sonorensis,
+      Bacillus subtilis,Bacillus haynesii")
 
 Requires the 'datasets' CLI (NCBI Datasets) and 'fastANI' on PATH, plus
 'unzip'. Install via conda:
@@ -26,7 +27,7 @@ EOF
     exit 1
 }
 
-TAXA="Bacillus licheniformis,Bacillus paralicheniformis,Bacillus sonorensis"
+TAXA="Bacillus licheniformis,Bacillus paralicheniformis,Bacillus sonorensis,Bacillus subtilis,Bacillus haynesii"
 
 while getopts "q:o:t:h" opt; do
     case "$opt" in
