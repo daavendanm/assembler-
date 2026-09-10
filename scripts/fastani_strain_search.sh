@@ -17,9 +17,11 @@ Optional:
   -t  Taxon to search within (default: "Bacillus paralicheniformis")
   -n  Maximum number of genomes to download and compare (default: 25)
   -l  Assembly level filter passed to 'datasets': one of
-      complete_genome, chromosome, scaffold, contig (default:
-      complete_genome -- keeps the download small and the genomes
-      high-quality; loosen this if too few complete genomes exist)
+      complete, chromosome, scaffold, contig (default: complete --
+      keeps the download small and the genomes high-quality; loosen
+      this if too few complete genomes exist). Check your installed
+      CLI's accepted values with:
+      datasets summary genome taxon --help
 
 Requires 'datasets' (NCBI Datasets CLI), 'jq', 'unzip', and 'fastANI' on
 PATH. Install via conda:
@@ -27,19 +29,20 @@ PATH. Install via conda:
   conda install -c bioconda fastani
   sudo apt-get install -y unzip
 
-Note: this script relies on the current 'datasets' CLI's flags and JSON
+Note: this script relies on the installed 'datasets' CLI's flags and JSON
 field names (--assembly-level values, the per-assembly "accession" field
-in --as-json-lines output). If NCBI has changed these since this script
-was written, run:
+in --as-json-lines output). These have changed across CLI versions -- if
+-l's default is rejected, pass the value your version's --help lists; if
+the accession lookup returns nothing, run:
   datasets summary genome taxon "Bacillus paralicheniformis" --as-json-lines | head -n 1 | jq .
-first to confirm the field name, and adjust the jq filter below if needed.
+to confirm the field name, and adjust the jq filter below if needed.
 EOF
     exit 1
 }
 
 TAXON="Bacillus paralicheniformis"
 MAX_GENOMES=25
-ASSEMBLY_LEVEL="complete_genome"
+ASSEMBLY_LEVEL="complete"
 
 while getopts "q:o:t:n:l:h" opt; do
     case "$opt" in
