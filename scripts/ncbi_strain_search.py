@@ -2,11 +2,13 @@
 """Search NCBI (BLASTN) for public genomes matching a reference-based
 consensus sequence, to identify the closest known strain.
 
-Note: submitting a whole bacterial genome (a few Mb) as a single query to
-NCBI's web BLAST is slow and not what the service is meant for. For
-genome-scale comparison prefer a local BLAST+ database or FastANI/Mash
-against downloaded genomes; this script is best suited to individual
-contigs/regions of interest, or used sparingly with --delay respected.
+NCBI's web BLAST rejects any single query over 1,000,000 bases, so a
+whole bacterial genome (a few Mb) is split into chunks below that limit
+and each chunk is submitted separately. This makes a whole-genome search
+slow (one NCBI queue wait per chunk); for genome-scale comparison a local
+BLAST+ database or FastANI/Mash against downloaded genomes is faster and
+more appropriate. This script remains a reasonable option when you want
+results straight from NCBI's own database with no local setup.
 """
 
 import argparse
@@ -16,6 +18,10 @@ import time
 
 from Bio import SeqIO
 from Bio.Blast import NCBIWWW, NCBIXML
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+
+NCBI_MAX_QUERY_LENGTH = 1_000_000
 
 
 def parse_args():
@@ -37,8 +43,23 @@ def parse_args():
                          help="Number of hits to keep per query sequence (default: 10)")
     parser.add_argument("--delay", type=float, default=10.0,
                          help="Seconds to wait between successive NCBI requests "
-                              "when the input has multiple sequences (default: 10)")
+                              "(default: 10)")
+    parser.add_argument("--chunk-size", type=int, default=900_000,
+                         help="Split any sequence longer than this into "
+                              "consecutive chunks before submitting to NCBI "
+                              "(default: 900000; NCBI's hard limit is 1000000)")
     return parser.parse_args()
+
+
+def chunk_record(record, chunk_size):
+    seq = str(record.seq)
+    if len(seq) <= chunk_size:
+        yield record
+        return
+    for start in range(0, len(seq), chunk_size):
+        end = min(start + chunk_size, len(seq))
+        sub_seq = Seq(seq[start:end])
+        yield SeqRecord(sub_seq, id=f"{record.id}_{start + 1}-{end}", description="")
 
 
 def run_blast(record, args):
@@ -80,12 +101,19 @@ def main():
     if not records:
         sys.exit(f"No sequences found in {args.input}")
 
+    queries = [chunk for record in records for chunk in chunk_record(record, args.chunk_size)]
+    if len(queries) > len(records):
+        print(f"Input split into {len(queries)} chunks of up to "
+              f"{args.chunk_size} bases (NCBI's limit is "
+              f"{NCBI_MAX_QUERY_LENGTH}). This will take a while: each "
+              f"chunk is a separate NCBI submission.", file=sys.stderr)
+
     all_rows = []
-    for i, record in enumerate(records):
-        print(f"Submitting {record.id} to NCBI BLAST "
+    for i, query in enumerate(queries):
+        print(f"Submitting {query.id} to NCBI BLAST "
               f"({args.program} vs {args.database})...", file=sys.stderr)
-        blast_record = run_blast(record, args)
-        rows = collect_hits(record.id, blast_record, len(record.seq))
+        blast_record = run_blast(query, args)
+        rows = collect_hits(query.id, blast_record, len(query.seq))
         all_rows.extend(rows)
         if rows:
             top = rows[0]
@@ -95,7 +123,7 @@ def main():
                   f"{top['query_coverage_pct']}% coverage)", file=sys.stderr)
         else:
             print("  No hits returned.", file=sys.stderr)
-        if i < len(records) - 1:
+        if i < len(queries) - 1:
             time.sleep(args.delay)
 
     if not all_rows:
