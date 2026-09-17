@@ -76,7 +76,14 @@ for f in "$GENOMES_DIR"/*.fasta; do
     fi
     cp "$f" "$INPUT_DIR"/
 done
-cp "$QUERY" "$INPUT_DIR/isolate_query.fasta"
+awk '/^>/ { print ">isolate_query"; next } { print }' "$QUERY" > "$INPUT_DIR/isolate_query.fasta"
+
+DUPES=$(grep -h '^>' "$INPUT_DIR"/*.fasta "$BACKBONE" | sort | uniq -d || true)
+if [[ -n "$DUPES" ]]; then
+    echo "Error: duplicate sequence header(s) found across input genomes -- Parsnp indexes by header and will fail or crash on these:" >&2
+    echo "$DUPES" >&2
+    exit 1
+fi
 
 N_GENOMES=$(find "$INPUT_DIR" -name "*.fasta" | wc -l)
 if [[ "$N_GENOMES" -lt 3 ]]; then
