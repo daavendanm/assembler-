@@ -66,6 +66,7 @@ done
 
 mkdir -p "$OUTDIR"
 INPUT_DIR="$OUTDIR/genomes_for_tree"
+rm -rf "$INPUT_DIR"
 mkdir -p "$INPUT_DIR"
 
 BACKBONE_REAL=$(realpath "$BACKBONE")
