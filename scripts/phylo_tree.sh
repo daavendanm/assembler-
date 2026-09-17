@@ -68,7 +68,14 @@ mkdir -p "$OUTDIR"
 INPUT_DIR="$OUTDIR/genomes_for_tree"
 mkdir -p "$INPUT_DIR"
 
-cp "$GENOMES_DIR"/*.fasta "$INPUT_DIR"/ 2>/dev/null || true
+BACKBONE_REAL=$(realpath "$BACKBONE")
+for f in "$GENOMES_DIR"/*.fasta; do
+    [[ -e "$f" ]] || continue
+    if [[ "$(realpath "$f")" == "$BACKBONE_REAL" ]]; then
+        continue
+    fi
+    cp "$f" "$INPUT_DIR"/
+done
 cp "$QUERY" "$INPUT_DIR/isolate_query.fasta"
 
 N_GENOMES=$(find "$INPUT_DIR" -name "*.fasta" | wc -l)
