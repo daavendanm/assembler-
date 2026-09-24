@@ -1,0 +1,8 @@
+name: denovo
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - seqtk
+  - unicycler
+  - spades
