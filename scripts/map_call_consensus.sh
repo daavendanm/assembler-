@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") -r REFERENCE.fasta -1 R1.fastq.gz -2 R2.fastq.gz -o OUTPUT_PREFIX [-t THREADS] [-q MIN_QUAL] [-d MIN_DEPTH] [-k MASK_DEPTH] [-m MIN_MAPQ] [-b MIN_BASEQ] [-D MAX_DEPTH]
+Usage: $(basename "$0") -r REFERENCE.fasta -1 R1.fastq.gz -2 R2.fastq.gz -o OUTPUT_PREFIX [-t THREADS] [-q MIN_QUAL] [-d MIN_DEPTH] [-k MASK_DEPTH] [-m MIN_MAPQ] [-b MIN_BASEQ] [-D MAX_DEPTH] [-K KRAKEN2_DB] [-T]
 
 Reference-based mapping, variant calling, and consensus generation for
 paired-end Illumina reads (bwa-mem + bcftools). No de novo assembly.
@@ -15,6 +15,14 @@ sequence the reads actually support. Breadth of coverage and the number of
 masked bases are written to the summary file. PCR/optical duplicates are
 marked (samtools fixmate + markdup) and are therefore ignored by mpileup;
 the duplicate rate and mapping statistics are written next to the BAM.
+
+Reads are adapter/quality trimmed with fastp before mapping. Indels are
+left-aligned and normalised (bcftools norm) before filtering, and SNPs
+within 3 bp of an indel or indels within 10 bp of each other are thinned
+(bcftools filter -g/-G), the classic source of false calls around
+homopolymers. Reads that do not map to the reference are written to FASTQ
+and, if a Kraken2 database is given, classified to show whether they are
+contamination or strain-specific sequence.
 
 Required:
   -r  Reference genome, FASTA (e.g. closest public Bacillus licheniformis genome)
@@ -37,6 +45,10 @@ Optional:
   -D  Max per-file depth for mpileup (default: 2000). bcftools' own default
       is 250, which silently discards most reads at typical bacterial
       Illumina depth; set this to a few times your expected coverage.
+  -K  Kraken2 database directory, used to classify unmapped reads. Without
+      it the unmapped reads are still extracted, but the summary records
+      the contamination screen as NOT RUN.
+  -T  Reads are already trimmed; skip fastp
 EOF
     exit 1
 }
@@ -48,8 +60,10 @@ MASK_DEPTH=1
 MIN_MAPQ=20
 MIN_BASEQ=20
 MAX_DEPTH=2000
+KRAKEN_DB=""
+SKIP_TRIM=0
 
-while getopts "r:1:2:o:t:q:d:k:m:b:D:h" opt; do
+while getopts "r:1:2:o:t:q:d:k:m:b:D:K:Th" opt; do
     case "$opt" in
         r) REF="$OPTARG" ;;
         1) R1="$OPTARG" ;;
@@ -62,6 +76,8 @@ while getopts "r:1:2:o:t:q:d:k:m:b:D:h" opt; do
         m) MIN_MAPQ="$OPTARG" ;;
         b) MIN_BASEQ="$OPTARG" ;;
         D) MAX_DEPTH="$OPTARG" ;;
+        K) KRAKEN_DB="$OPTARG" ;;
+        T) SKIP_TRIM=1 ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -71,46 +87,74 @@ if [[ -z "${REF:-}" || -z "${R1:-}" || -z "${R2:-}" || -z "${OUT:-}" ]]; then
     usage
 fi
 
-for tool in bwa samtools bcftools; do
+REQUIRED_TOOLS=(bwa samtools bcftools)
+[[ "$SKIP_TRIM" -eq 1 ]] || REQUIRED_TOOLS+=(fastp)
+[[ -z "$KRAKEN_DB" ]] || REQUIRED_TOOLS+=(kraken2)
+for tool in "${REQUIRED_TOOLS[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Error: $tool not found in PATH" >&2; exit 1; }
 done
 
 for f in "$REF" "$R1" "$R2"; do
     [[ -f "$f" ]] || { echo "Error: file not found: $f" >&2; exit 1; }
 done
+if [[ -n "$KRAKEN_DB" && ! -d "$KRAKEN_DB" ]]; then
+    echo "Error: Kraken2 database directory not found: $KRAKEN_DB" >&2
+    exit 1
+fi
 
 outdir="$(dirname "$OUT")"
 [[ "$outdir" == "." ]] || mkdir -p "$outdir"
 
 if [[ ! -f "${REF}.bwt" ]]; then
-    echo "[1/6] Indexing reference..." >&2
+    echo "[1/8] Indexing reference..." >&2
     bwa index "$REF"
 fi
 [[ -f "${REF}.fai" ]] || samtools faidx "$REF"
 
-echo "[2/6] Mapping reads with bwa-mem and marking duplicates..." >&2
+if [[ "$SKIP_TRIM" -eq 1 ]]; then
+    echo "[2/8] -T given; mapping reads as supplied (no trimming)." >&2
+    MAP_R1="$R1"
+    MAP_R2="$R2"
+else
+    echo "[2/8] Trimming adapters and low-quality tails with fastp..." >&2
+    MAP_R1="${OUT}.trimmed_1.fastq.gz"
+    MAP_R2="${OUT}.trimmed_2.fastq.gz"
+    fastp -i "$R1" -I "$R2" -o "$MAP_R1" -O "$MAP_R2" \
+        --detect_adapter_for_pe --cut_tail --cut_mean_quality 20 \
+        --length_required 50 -w "$THREADS" \
+        -j "${OUT}.fastp.json" -h "${OUT}.fastp.html"
+fi
+
+echo "[3/8] Mapping reads with bwa-mem and marking duplicates..." >&2
 # bwa-mem output is grouped by read name, which is what fixmate needs.
 # fixmate -m adds the mate-score tags markdup uses; duplicates are flagged
 # (0x400), not removed, and mpileup's default filter then skips them.
-bwa mem -t "$THREADS" "$REF" "$R1" "$R2" \
+bwa mem -t "$THREADS" "$REF" "$MAP_R1" "$MAP_R2" \
     | samtools fixmate -u -m -@ "$THREADS" - - \
     | samtools sort -u -@ "$THREADS" -T "${OUT}.sorttmp" - \
     | samtools markdup -@ "$THREADS" -f "${OUT}.markdup.txt" - "${OUT}.sorted.bam"
 samtools index "${OUT}.sorted.bam"
 samtools flagstat -@ "$THREADS" "${OUT}.sorted.bam" > "${OUT}.flagstat.txt"
 
-echo "[3/6] Calling variants with bcftools (MAPQ>=${MIN_MAPQ}, BQ>=${MIN_BASEQ}, max depth ${MAX_DEPTH})..." >&2
+echo "[4/8] Calling and normalising variants (MAPQ>=${MIN_MAPQ}, BQ>=${MIN_BASEQ}, max depth ${MAX_DEPTH})..." >&2
+# norm left-aligns indels against the reference so the same event in a
+# homopolymer/repeat always gets the same coordinates; -c e aborts if a
+# VCF REF allele disagrees with the FASTA (e.g. a stale index).
 bcftools mpileup -f "$REF" -q "$MIN_MAPQ" -Q "$MIN_BASEQ" -d "$MAX_DEPTH" \
     -a AD,DP,ADF,ADR -Ou "${OUT}.sorted.bam" \
-    | bcftools call -mv --ploidy 1 -Oz -o "${OUT}.raw.vcf.gz"
+    | bcftools call -mv --ploidy 1 -Ou \
+    | bcftools norm -f "$REF" -c e -Oz -o "${OUT}.raw.vcf.gz"
 bcftools index -f "${OUT}.raw.vcf.gz"
 
-echo "[4/6] Filtering variants (QUAL>=${MIN_QUAL}, DP>=${MIN_DEPTH})..." >&2
-bcftools filter -e "QUAL<${MIN_QUAL} || DP<${MIN_DEPTH}" \
-    "${OUT}.raw.vcf.gz" -Oz -o "${OUT}.filtered.vcf.gz"
+echo "[5/8] Filtering variants (QUAL>=${MIN_QUAL}, DP>=${MIN_DEPTH}, SnpGap 3, IndelGap 10)..." >&2
+# -e drops failing records outright, but -g/-G only set FILTER=SnpGap /
+# IndelGap; consensus would still apply those, so keep PASS records only.
+bcftools filter -e "QUAL<${MIN_QUAL} || DP<${MIN_DEPTH}" -g 3 -G 10 \
+    "${OUT}.raw.vcf.gz" -Ou \
+    | bcftools view -f 'PASS,.' -Oz -o "${OUT}.filtered.vcf.gz"
 bcftools index -f "${OUT}.filtered.vcf.gz"
 
-echo "[5/6] Building consensus sequence (depth < ${MASK_DEPTH} masked as N)..." >&2
+echo "[6/8] Building consensus sequence (depth < ${MASK_DEPTH} masked as N)..." >&2
 # -aa: report every reference position, including zero-depth ones and
 # contigs with no reads at all. -J: count deletions as covered, so a
 # called deletion is not also masked.
@@ -127,7 +171,22 @@ awk -v min="$MASK_DEPTH" 'BEGIN { OFS = "\t" }
 bcftools consensus -f "$REF" -m "${OUT}.low_coverage.bed" \
     "${OUT}.filtered.vcf.gz" > "${OUT}.consensus.fasta"
 
-echo "[6/6] Writing variant call and coverage statistics..." >&2
+echo "[7/8] Extracting unmapped reads${KRAKEN_DB:+ and classifying with Kraken2}..." >&2
+# -f 4: reads that are themselves unmapped. Pairs where both mates are
+# unmapped go to _1/_2; an unmapped read whose mate mapped goes to _single.
+samtools collate -u -O -@ "$THREADS" "${OUT}.sorted.bam" "${OUT}.collatetmp" \
+    | samtools fastq -f 4 -@ "$THREADS" \
+        -1 "${OUT}.unmapped_1.fastq.gz" -2 "${OUT}.unmapped_2.fastq.gz" \
+        -s "${OUT}.unmapped_single.fastq.gz" -0 /dev/null -
+if [[ -n "$KRAKEN_DB" ]]; then
+    # Classified per read (not --paired) so singletons are included.
+    kraken2 --db "$KRAKEN_DB" --threads "$THREADS" --gzip-compressed \
+        --report "${OUT}.unmapped.kraken2.report" --output /dev/null \
+        "${OUT}.unmapped_1.fastq.gz" "${OUT}.unmapped_2.fastq.gz" \
+        "${OUT}.unmapped_single.fastq.gz"
+fi
+
+echo "[8/8] Writing variant call and coverage statistics..." >&2
 bcftools stats "${OUT}.filtered.vcf.gz" > "${OUT}.stats.txt"
 awk -v mask="$MASK_DEPTH" '
     { n++; if ($3 >= 1) c1++; if ($3 >= 10) c10++; if ($3 < mask) m++ }
@@ -145,10 +204,30 @@ grep -v '^>' "${OUT}.consensus.fasta" | tr -d '\n' | awk '
         printf "consensus_N_bases\t%d\n", n
         printf "consensus_GC_pct_excl_N\t%.4f\n", (len - n) ? 100 * gc / (len - n) : 0
     }' >> "${OUT}.coverage_summary.tsv"
+{
+    for v in raw filtered; do
+        printf '%s_snps\t%d\n' "$v" "$(bcftools view -H -v snps "${OUT}.${v}.vcf.gz" | wc -l)"
+        printf '%s_indels\t%d\n' "$v" "$(bcftools view -H -v indels "${OUT}.${v}.vcf.gz" | wc -l)"
+    done
+    printf 'reads_unmapped\t%d\n' "$(samtools view -c -f 4 "${OUT}.sorted.bam")"
+    if [[ -n "$KRAKEN_DB" ]]; then
+        # Top 5 species among unmapped reads, from the Kraken2 report.
+        printf 'unmapped_kraken2_unclassified_pct\t%s\n' \
+            "$(awk -F'\t' '$4 == "U" { print $1 + 0 }' "${OUT}.unmapped.kraken2.report")"
+        printf 'unmapped_kraken2_top_species\t%s\n' \
+            "$(awk -F'\t' '$4 == "S" { gsub(/^ +/, "", $6); printf "%s%% %s\n", $1 + 0, $6 }' \
+                "${OUT}.unmapped.kraken2.report" | sort -rn | head -n 5 | paste -sd ';' -)"
+    else
+        printf 'unmapped_contamination_screen\tNOT RUN (no -K Kraken2 database)\n'
+    fi
+} >> "${OUT}.coverage_summary.tsv"
 
 echo "Done." >&2
 echo "  Sorted BAM:        ${OUT}.sorted.bam (duplicates marked)" >&2
 echo "  Mapping stats:     ${OUT}.flagstat.txt" >&2
+[[ "$SKIP_TRIM" -eq 1 ]] || echo "  fastp report:      ${OUT}.fastp.html" >&2
+echo "  Unmapped reads:    ${OUT}.unmapped_{1,2,single}.fastq.gz" >&2
+[[ -z "$KRAKEN_DB" ]] || echo "  Unmapped Kraken2:  ${OUT}.unmapped.kraken2.report" >&2
 echo "  Duplicate stats:   ${OUT}.markdup.txt" >&2
 echo "  Filtered variants: ${OUT}.filtered.vcf.gz" >&2
 echo "  Consensus genome:  ${OUT}.consensus.fasta (N = no read support)" >&2
