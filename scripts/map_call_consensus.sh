@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") -r REFERENCE.fasta -1 R1.fastq.gz -2 R2.fastq.gz -o OUTPUT_PREFIX [-t THREADS] [-q MIN_QUAL] [-d MIN_DEPTH] [-k MASK_DEPTH] [-m MIN_MAPQ] [-b MIN_BASEQ] [-D MAX_DEPTH] [-K KRAKEN2_DB] [-T]
+Usage: $(basename "$0") -r REFERENCE.fasta -1 R1.fastq.gz -2 R2.fastq.gz -o OUTPUT_PREFIX [-t THREADS] [-q MIN_QUAL] [-d MIN_DEPTH] [-k MASK_DEPTH] [-m MIN_MAPQ] [-b MIN_BASEQ] [-D MAX_DEPTH] [-M SORT_MEM] [-K KRAKEN2_DB] [-T]
 
 Reference-based mapping, variant calling, and consensus generation for
 paired-end Illumina reads (bwa-mem + bcftools). No de novo assembly.
@@ -45,6 +45,9 @@ Optional:
   -D  Max per-file depth for mpileup (default: 2000). bcftools' own default
       is 250, which silently discards most reads at typical bacterial
       Illumina depth; set this to a few times your expected coverage.
+  -M  Memory per samtools sort thread (default: 512M). Sort uses roughly
+      THREADS x SORT_MEM; lower this or -t on low-memory machines (WSL,
+      laptops) if sort fails with "couldn't allocate memory".
   -K  Kraken2 database directory, used to classify unmapped reads. Without
       it the unmapped reads are still extracted, but the summary records
       the contamination screen as NOT RUN.
@@ -60,10 +63,11 @@ MASK_DEPTH=1
 MIN_MAPQ=20
 MIN_BASEQ=20
 MAX_DEPTH=2000
+SORT_MEM=512M
 KRAKEN_DB=""
 SKIP_TRIM=0
 
-while getopts "r:1:2:o:t:q:d:k:m:b:D:K:Th" opt; do
+while getopts "r:1:2:o:t:q:d:k:m:b:D:M:K:Th" opt; do
     case "$opt" in
         r) REF="$OPTARG" ;;
         1) R1="$OPTARG" ;;
@@ -76,6 +80,7 @@ while getopts "r:1:2:o:t:q:d:k:m:b:D:K:Th" opt; do
         m) MIN_MAPQ="$OPTARG" ;;
         b) MIN_BASEQ="$OPTARG" ;;
         D) MAX_DEPTH="$OPTARG" ;;
+        M) SORT_MEM="$OPTARG" ;;
         K) KRAKEN_DB="$OPTARG" ;;
         T) SKIP_TRIM=1 ;;
         h) usage ;;
@@ -131,7 +136,7 @@ echo "[3/8] Mapping reads with bwa-mem and marking duplicates..." >&2
 # (0x400), not removed, and mpileup's default filter then skips them.
 bwa mem -t "$THREADS" "$REF" "$MAP_R1" "$MAP_R2" \
     | samtools fixmate -u -m -@ "$THREADS" - - \
-    | samtools sort -u -@ "$THREADS" -T "${OUT}.sorttmp" - \
+    | samtools sort -u -@ "$THREADS" -m "$SORT_MEM" -T "${OUT}.sorttmp" - \
     | samtools markdup -@ "$THREADS" -f "${OUT}.markdup.txt" - "${OUT}.sorted.bam"
 samtools index "${OUT}.sorted.bam"
 samtools flagstat -@ "$THREADS" "${OUT}.sorted.bam" > "${OUT}.flagstat.txt"
@@ -147,9 +152,11 @@ bcftools mpileup -f "$REF" -q "$MIN_MAPQ" -Q "$MIN_BASEQ" -d "$MAX_DEPTH" \
 bcftools index -f "${OUT}.raw.vcf.gz"
 
 echo "[5/8] Filtering variants (QUAL>=${MIN_QUAL}, DP>=${MIN_DEPTH}, SnpGap 3, IndelGap 10)..." >&2
+# INFO/DP (site depth) must be named explicitly: mpileup -a DP also adds
+# FORMAT/DP, and bcftools >= 1.10 refuses a bare "DP" as ambiguous.
 # -e drops failing records outright, but -g/-G only set FILTER=SnpGap /
 # IndelGap; consensus would still apply those, so keep PASS records only.
-bcftools filter -e "QUAL<${MIN_QUAL} || DP<${MIN_DEPTH}" -g 3 -G 10 \
+bcftools filter -e "QUAL<${MIN_QUAL} || INFO/DP<${MIN_DEPTH}" -g 3 -G 10 \
     "${OUT}.raw.vcf.gz" -Ou \
     | bcftools view -f 'PASS,.' -Oz -o "${OUT}.filtered.vcf.gz"
 bcftools index -f "${OUT}.filtered.vcf.gz"
