@@ -1,0 +1,14 @@
+name: mapping
+channels:
+  - conda-forge
+  - bioconda
+# Tools for scripts/map_call_consensus.sh. Kept separate from
+# environment_denovo.yml: solved together with Unicycler/BUSCO, conda can
+# fall back to bcftools 1.9, which fails on current Linux with
+# "libcrypto.so.1.0.0: cannot open shared object file".
+dependencies:
+  - bwa
+  - samtools>=1.20
+  - bcftools>=1.20
+  - fastp
+  - kraken2
