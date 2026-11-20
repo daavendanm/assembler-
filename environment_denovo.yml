@@ -8,5 +8,7 @@ dependencies:
   - unicycler
   - spades
   - quast
+  # QUAST imports distutils, removed in Python 3.12; setuptools provides it.
+  - setuptools
   - busco>=5
   - kraken2
