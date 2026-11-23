@@ -157,7 +157,7 @@ bcftools index -f "${OUT}.raw.vcf.gz"
 STEP=$((STEP + 1))
 
 echo "[${STEP}/${STEP_TOTAL}] Filtering variants (QUAL>=${MIN_QUAL}, DP>=${MIN_DEPTH})..." >&2
-bcftools filter -e "QUAL<${MIN_QUAL} || DP<${MIN_DEPTH}" \
+bcftools filter -e "QUAL<${MIN_QUAL} || INFO/DP<${MIN_DEPTH}" \
     "${OUT}.raw.vcf.gz" -Oz -o "${OUT}.filtered.vcf.gz"
 bcftools index -f "${OUT}.filtered.vcf.gz"
 STEP=$((STEP + 1))
